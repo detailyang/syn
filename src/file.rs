@@ -1,9 +1,14 @@
-use super::*;
+use crate::attr::Attribute;
+use crate::item::Item;
+use alloc::string::String;
+use alloc::vec::Vec;
 
 ast_struct! {
     /// A complete file of Rust source code.
     ///
-    /// *This type is available only if Syn is built with the `"full"` feature.*
+    /// Typically `File` objects are created with [`parse_file`].
+    ///
+    /// [`parse_file`]: crate::parse_file
     ///
     /// # Example
     ///
@@ -12,8 +17,7 @@ ast_struct! {
     ///
     /// ```
     /// use std::env;
-    /// use std::fs::File;
-    /// use std::io::Read;
+    /// use std::fs;
     /// use std::process;
     ///
     /// fn main() {
@@ -31,12 +35,8 @@ ast_struct! {
     ///         }
     ///     };
     ///
-    ///     let mut file = File::open(&filename).expect("Unable to open file");
-    ///
-    ///     let mut src = String::new();
-    ///     file.read_to_string(&mut src).expect("Unable to read file");
-    ///
-    ///     let syntax = syn::parse_file(&src).expect("Unable to parse file");
+    ///     let src = fs::read_to_string(&filename).expect("unable to read file");
+    ///     let syntax = syn::parse_file(&src).expect("unable to parse file");
     ///
     ///     // Debug impl is available if Syn is built with "extra-traits" feature.
     ///     println!("{:#?}", syntax);
@@ -49,43 +49,63 @@ ast_struct! {
     /// ```text
     /// File {
     ///     shebang: None,
+    ///     frontmatter: None,
     ///     attrs: [],
     ///     items: [
-    ///         ExternCrate(
-    ///             ItemExternCrate {
-    ///                 attrs: [],
-    ///                 vis: Inherited,
-    ///                 extern_token: Extern,
-    ///                 crate_token: Crate,
-    ///                 ident: Ident {
-    ///                     term: Term(
-    ///                         "syn"
+    ///         Item::Use {
+    ///             attrs: [],
+    ///             vis: Visibility::Inherited,
+    ///             use_token: Token![use],
+    ///             leading_colon: None,
+    ///             tree: UseTree::Path(
+    ///                 UsePath {
+    ///                     ident: Ident(
+    ///                         std,
     ///                     ),
-    ///                     span: Span
+    ///                     colon2_token: Token![::],
+    ///                     tree: UseTree::Name(
+    ///                         UseName {
+    ///                             ident: Ident(
+    ///                                 env,
+    ///                             ),
+    ///                         },
+    ///                     ),
     ///                 },
-    ///                 rename: None,
-    ///                 semi_token: Semi
-    ///             }
-    ///         ),
+    ///             ),
+    ///             semi_token: Token![;],
+    ///         },
     /// ...
     /// ```
+    #[cfg_attr(docsrs, doc(cfg(feature = "full")))]
     pub struct File {
         pub shebang: Option<String>,
+        pub frontmatter: Option<Frontmatter>,
         pub attrs: Vec<Attribute>,
         pub items: Vec<Item>,
     }
 }
 
+ast_struct! {
+    /// A frontmatter section fenced by `---`.
+    #[cfg_attr(docsrs, doc(cfg(feature = "full")))]
+    #[non_exhaustive]
+    pub struct Frontmatter {}
+}
+
 #[cfg(feature = "parsing")]
-pub mod parsing {
-    use super::*;
+pub(crate) mod parsing {
+    use crate::attr::Attribute;
+    use crate::error::Result;
+    use crate::file::File;
+    use crate::parse::{Parse, ParseStream};
+    use alloc::vec::Vec;
 
-    use crate::parse::{Parse, ParseStream, Result};
-
+    #[cfg_attr(docsrs, doc(cfg(feature = "parsing")))]
     impl Parse for File {
         fn parse(input: ParseStream) -> Result<Self> {
             Ok(File {
                 shebang: None,
+                frontmatter: None,
                 attrs: input.call(Attribute::parse_inner)?,
                 items: {
                     let mut items = Vec::new();
@@ -101,11 +121,12 @@ pub mod parsing {
 
 #[cfg(feature = "printing")]
 mod printing {
-    use super::*;
     use crate::attr::FilterAttrs;
+    use crate::file::File;
     use proc_macro2::TokenStream;
-    use quote::{ToTokens, TokenStreamExt};
+    use quote::{ToTokens, TokenStreamExt as _};
 
+    #[cfg_attr(docsrs, doc(cfg(feature = "printing")))]
     impl ToTokens for File {
         fn to_tokens(&self, tokens: &mut TokenStream) {
             tokens.append_all(self.attrs.inner());

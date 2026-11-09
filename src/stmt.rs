@@ -1,9 +1,17 @@
-use super::*;
+use crate::attr::Attribute;
+#[cfg(feature = "parsing")]
+use crate::error::Result;
+use crate::expr::Expr;
+use crate::item::Item;
+use crate::mac::Macro;
+use crate::pat::Pat;
+use crate::token;
+use alloc::boxed::Box;
+use alloc::vec::Vec;
 
 ast_struct! {
     /// A braced block containing Rust statements.
-    ///
-    /// *This type is available only if Syn is built with the `"full"` feature.*
+    #[cfg_attr(docsrs, doc(cfg(feature = "full")))]
     pub struct Block {
         pub brace_token: token::Brace,
         /// Statements in a block
@@ -13,8 +21,7 @@ ast_struct! {
 
 ast_enum! {
     /// A statement, usually ending in a semicolon.
-    ///
-    /// *This type is available only if Syn is built with the `"full"` feature.*
+    #[cfg_attr(docsrs, doc(cfg(feature = "full")))]
     pub enum Stmt {
         /// A local (let) binding.
         Local(Local),
@@ -22,41 +29,115 @@ ast_enum! {
         /// An item definition.
         Item(Item),
 
-        /// Expr without trailing semicolon.
-        Expr(Expr),
+        /// Expression, with or without trailing semicolon.
+        Expr(Expr, Option<Token![;]>),
 
-        /// Expression with trailing semicolon.
-        Semi(Expr, Token![;]),
+        /// A macro invocation in statement position.
+        ///
+        /// Syntactically it's ambiguous which other kind of statement this
+        /// macro would expand to. It can be any of local variable (`let`),
+        /// item, or expression.
+        Macro(StmtMacro),
     }
 }
 
 ast_struct! {
-    /// A local `let` binding: `let x: u64 = s.parse()?`.
-    ///
-    /// *This type is available only if Syn is built with the `"full"` feature.*
+    /// A local `let` binding: `let x: u64 = s.parse()?;`.
+    #[cfg_attr(docsrs, doc(cfg(feature = "full")))]
     pub struct Local {
         pub attrs: Vec<Attribute>,
         pub let_token: Token![let],
+        /// (Non-exhaustive) Additional optional information about a local.
+        pub modifiers: LocalModifiers,
         pub pat: Pat,
-        pub init: Option<(Token![=], Box<Expr>)>,
+        pub init: Option<LocalInit>,
         pub semi_token: Token![;],
     }
 }
 
-#[cfg(feature = "parsing")]
-pub mod parsing {
-    use super::*;
+ast_struct! {
+    /// The expression assigned in a local `let` binding, including optional
+    /// diverging `else` block.
+    ///
+    /// `LocalInit` represents `= s.parse()?` in `let x: u64 = s.parse()?` and
+    /// `= r else { return }` in `let Ok(x) = r else { return }`.
+    #[cfg_attr(docsrs, doc(cfg(feature = "full")))]
+    pub struct LocalInit {
+        pub eq_token: Token![=],
+        pub expr: Box<Expr>,
+        pub diverge: Option<(Token![else], Box<Expr>)>,
+    }
+}
 
-    use crate::parse::discouraged::Speculative;
-    use crate::parse::{Parse, ParseStream, Result};
+ast_struct! {
+    /// Additional optional information about a `let` statement.
+    /// This data structure may grow to accommodate future Rust language
+    /// changes, including the following in-progress RFCs:
+    ///
+    /// - [#139076] "Super let"
+    ///
+    /// [#139076]: https://github.com/rust-lang/rust/issues/139076
+    #[cfg_attr(docsrs, doc(cfg(feature = "full")))]
+    #[non_exhaustive]
+    pub struct LocalModifiers {}
+}
+
+impl Default for LocalModifiers {
+    fn default() -> Self {
+        LocalModifiers {}
+    }
+}
+
+impl LocalModifiers {
+    #[cfg(feature = "parsing")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "parsing")))]
+    pub fn require_empty(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+ast_struct! {
+    /// A macro invocation in statement position.
+    ///
+    /// Syntactically it's ambiguous which other kind of statement this macro
+    /// would expand to. It can be any of local variable (`let`), item, or
+    /// expression.
+    #[cfg_attr(docsrs, doc(cfg(feature = "full")))]
+    pub struct StmtMacro {
+        pub attrs: Vec<Attribute>,
+        pub mac: Macro,
+        pub semi_token: Option<Token![;]>,
+    }
+}
+
+#[cfg(feature = "parsing")]
+pub(crate) mod parsing {
+    use crate::attr::Attribute;
+    use crate::buffer::Cursor;
+    use crate::classify;
+    use crate::error::Result;
+    use crate::expr::{Expr, ExprBlock, ExprMacro};
+    use crate::ident::Ident;
+    use crate::item;
+    use crate::mac::{self, Macro};
+    use crate::parse::discouraged::Speculative as _;
+    use crate::parse::{Parse, ParseStream};
+    use crate::pat::{Pat, PatType};
+    use crate::path::Path;
+    use crate::stmt::{Block, Local, LocalInit, LocalModifiers, Stmt, StmtMacro};
+    use crate::token;
+    use crate::ty::Type;
+    use crate::verbatim;
+    use alloc::boxed::Box;
+    use alloc::vec::Vec;
+    use core::mem;
     use proc_macro2::TokenStream;
+
+    struct AllowNoSemi(bool);
 
     impl Block {
         /// Parse the body of a block as zero or more statements, possibly
         /// including one trailing expression.
-        ///
-        /// *This function is available only if Syn is built with the `"parsing"`
-        /// feature.*
         ///
         /// # Example
         ///
@@ -104,32 +185,36 @@ pub mod parsing {
         ///     }
         /// }
         /// ```
+        #[cfg_attr(docsrs, doc(cfg(feature = "parsing")))]
         pub fn parse_within(input: ParseStream) -> Result<Vec<Stmt>> {
             let mut stmts = Vec::new();
             loop {
-                while let Some(semi) = input.parse::<Option<Token![;]>>()? {
-                    stmts.push(Stmt::Semi(Expr::Verbatim(TokenStream::new()), semi));
+                while let semi @ Some(_) = input.parse()? {
+                    stmts.push(Stmt::Expr(Expr::Verbatim(TokenStream::new()), semi));
                 }
                 if input.is_empty() {
                     break;
                 }
-                let s = parse_stmt(input, true)?;
-                let requires_semicolon = if let Stmt::Expr(s) = &s {
-                    expr::requires_terminator(s)
-                } else {
-                    false
+                let stmt = parse_stmt(input, AllowNoSemi(true))?;
+                let requires_semicolon = match &stmt {
+                    Stmt::Expr(stmt, None) => classify::requires_semi_to_be_stmt(stmt),
+                    Stmt::Macro(stmt) => {
+                        stmt.semi_token.is_none() && !stmt.mac.delimiter.is_brace()
+                    }
+                    Stmt::Local(_) | Stmt::Item(_) | Stmt::Expr(_, Some(_)) => false,
                 };
-                stmts.push(s);
+                stmts.push(stmt);
                 if input.is_empty() {
                     break;
                 } else if requires_semicolon {
-                    return Err(input.error("unexpected token"));
+                    return Err(input.error("unexpected token, expected `;`"));
                 }
             }
             Ok(stmts)
         }
     }
 
+    #[cfg_attr(docsrs, doc(cfg(feature = "parsing")))]
     impl Parse for Block {
         fn parse(input: ParseStream) -> Result<Self> {
             let content;
@@ -140,33 +225,57 @@ pub mod parsing {
         }
     }
 
+    #[cfg_attr(docsrs, doc(cfg(feature = "parsing")))]
     impl Parse for Stmt {
         fn parse(input: ParseStream) -> Result<Self> {
-            parse_stmt(input, false)
+            let allow_nosemi = AllowNoSemi(false);
+            parse_stmt(input, allow_nosemi)
         }
     }
 
-    fn parse_stmt(input: ParseStream, allow_nosemi: bool) -> Result<Stmt> {
-        let mut attrs = input.call(Attribute::parse_outer)?;
+    fn parse_stmt(input: ParseStream, allow_nosemi: AllowNoSemi) -> Result<Stmt> {
+        let begin = input.cursor();
+        let attrs = input.call(Attribute::parse_outer)?;
+        let attrs_end = input.cursor();
 
         // brace-style macros; paren and bracket macros get parsed as
         // expression statements.
         let ahead = input.fork();
+        let mut is_item_macro = false;
         if let Ok(path) = ahead.call(Path::parse_mod_style) {
-            if ahead.peek(Token![!]) && (ahead.peek2(token::Brace) || ahead.peek2(Ident)) {
-                input.advance_to(&ahead);
-                return stmt_mac(input, attrs, path);
+            if ahead.peek(Token![!]) {
+                if ahead.peek2(Ident) || ahead.peek2(Token![try]) {
+                    is_item_macro = true;
+                } else if ahead.peek2(token::Brace)
+                    && !(ahead.peek3(Token![.]) && !ahead.peek3(Token![..])
+                        || ahead.peek3(Token![?]))
+                {
+                    input.advance_to(&ahead);
+                    return stmt_mac(input, attrs, path).map(Stmt::Macro);
+                }
             }
         }
 
-        if input.peek(Token![let]) {
+        if input.peek(Token![let]) && !input.peek(token::Group) {
             stmt_local(input, attrs).map(Stmt::Local)
         } else if input.peek(Token![pub])
             || input.peek(Token![crate]) && !input.peek2(Token![::])
             || input.peek(Token![extern])
             || input.peek(Token![use])
-            || input.peek(Token![static]) && (input.peek2(Token![mut]) || input.peek2(Ident))
+            || input.peek(Token![static])
+                && (input.peek2(Token![mut])
+                    || input.peek2(Ident)
+                        && !(input.peek2(Token![async])
+                            && (input.peek3(Token![move]) || input.peek3(Token![|]))))
             || input.peek(Token![const])
+                && !(input.peek2(token::Brace)
+                    || input.peek2(Token![static])
+                    || input.peek2(Token![async])
+                        && !(input.peek3(Token![unsafe])
+                            || input.peek3(Token![extern])
+                            || input.peek3(Token![fn]))
+                    || input.peek2(Token![move])
+                    || input.peek2(Token![|]))
             || input.peek(Token![unsafe]) && !input.peek2(token::Brace)
             || input.peek(Token![async])
                 && (input.peek2(Token![unsafe])
@@ -175,7 +284,6 @@ pub mod parsing {
             || input.peek(Token![fn])
             || input.peek(Token![mod])
             || input.peek(Token![type])
-            || input.peek(item::parsing::existential) && input.peek2(Token![type])
             || input.peek(Token![struct])
             || input.peek(Token![enum])
             || input.peek(Token![union]) && input.peek2(Ident)
@@ -185,25 +293,22 @@ pub mod parsing {
                 && (input.peek2(Token![unsafe]) || input.peek2(Token![impl]))
             || input.peek(Token![impl])
             || input.peek(Token![macro])
+            || is_item_macro
         {
-            let mut item: Item = input.parse()?;
-            attrs.extend(item.replace_attrs(Vec::new()));
-            item.replace_attrs(attrs);
+            let item = item::parsing::parse_rest_of_item(begin, attrs, input)?;
             Ok(Stmt::Item(item))
         } else {
-            stmt_expr(input, allow_nosemi, attrs)
+            stmt_expr(begin, input, allow_nosemi, attrs, attrs_end)
         }
     }
 
-    fn stmt_mac(input: ParseStream, attrs: Vec<Attribute>, path: Path) -> Result<Stmt> {
+    fn stmt_mac(input: ParseStream, attrs: Vec<Attribute>, path: Path) -> Result<StmtMacro> {
         let bang_token: Token![!] = input.parse()?;
-        let ident: Option<Ident> = input.parse()?;
         let (delimiter, tokens) = mac::parse_delimiter(input)?;
         let semi_token: Option<Token![;]> = input.parse()?;
 
-        Ok(Stmt::Item(Item::Macro(ItemMacro {
+        Ok(StmtMacro {
             attrs,
-            ident,
             mac: Macro {
                 path,
                 bang_token,
@@ -211,60 +316,147 @@ pub mod parsing {
                 tokens,
             },
             semi_token,
-        })))
+        })
     }
 
     fn stmt_local(input: ParseStream, attrs: Vec<Attribute>) -> Result<Local> {
+        let let_token: Token![let] = input.parse()?;
+
+        let mut pat = Pat::parse_single(input)?;
+        if input.peek(Token![:]) {
+            let colon_token: Token![:] = input.parse()?;
+            let ty: Type = input.parse()?;
+            pat = Pat::Type(PatType {
+                attrs: Vec::new(),
+                pat: Box::new(pat),
+                colon_token,
+                ty: Box::new(ty),
+            });
+        }
+
+        let init = if let Some(eq_token) = input.parse()? {
+            let eq_token: Token![=] = eq_token;
+            let expr: Expr = input.parse()?;
+
+            let diverge = if !classify::expr_trailing_brace(&expr) && input.peek(Token![else]) {
+                let else_token: Token![else] = input.parse()?;
+                let diverge = ExprBlock {
+                    attrs: Vec::new(),
+                    label: None,
+                    block: input.parse()?,
+                };
+                Some((else_token, Box::new(Expr::Block(diverge))))
+            } else {
+                None
+            };
+
+            Some(LocalInit {
+                eq_token,
+                expr: Box::new(expr),
+                diverge,
+            })
+        } else {
+            None
+        };
+
+        let semi_token: Token![;] = input.parse()?;
+
         Ok(Local {
             attrs,
-            let_token: input.parse()?,
-            pat: {
-                let mut pat: Pat = pat::parsing::multi_pat_with_leading_vert(input)?;
-                if input.peek(Token![:]) {
-                    let colon_token: Token![:] = input.parse()?;
-                    let ty: Type = input.parse()?;
-                    pat = Pat::Type(PatType {
-                        attrs: Vec::new(),
-                        pat: Box::new(pat),
-                        colon_token,
-                        ty: Box::new(ty),
-                    });
-                }
-                pat
-            },
-            init: {
-                if input.peek(Token![=]) {
-                    let eq_token: Token![=] = input.parse()?;
-                    let init: Expr = input.parse()?;
-                    Some((eq_token, Box::new(init)))
-                } else {
-                    None
-                }
-            },
-            semi_token: input.parse()?,
+            let_token,
+            modifiers: LocalModifiers {},
+            pat,
+            init,
+            semi_token,
         })
     }
 
     fn stmt_expr(
+        begin: Cursor,
         input: ParseStream,
-        allow_nosemi: bool,
+        allow_nosemi: AllowNoSemi,
         mut attrs: Vec<Attribute>,
+        attrs_end: Cursor,
     ) -> Result<Stmt> {
-        let mut e = expr::parsing::expr_early(input)?;
+        let mut e = Expr::parse_with_earlier_boundary_rule(input)?;
 
         let mut attr_target = &mut e;
-        while let Expr::Binary(e) = attr_target {
-            attr_target = &mut e.left;
+        loop {
+            attr_target = match attr_target {
+                Expr::Assign(e) => &mut e.left,
+                Expr::Binary(e) => &mut e.left,
+                Expr::Cast(e) => &mut e.expr,
+                Expr::Array(_)
+                | Expr::Async(_)
+                | Expr::Await(_)
+                | Expr::Block(_)
+                | Expr::Break(_)
+                | Expr::Call(_)
+                | Expr::Closure(_)
+                | Expr::Const(_)
+                | Expr::Continue(_)
+                | Expr::Field(_)
+                | Expr::ForLoop(_)
+                | Expr::Group(_)
+                | Expr::If(_)
+                | Expr::Index(_)
+                | Expr::Infer(_)
+                | Expr::Let(_)
+                | Expr::Lit(_)
+                | Expr::Loop(_)
+                | Expr::Macro(_)
+                | Expr::Match(_)
+                | Expr::MethodCall(_)
+                | Expr::Paren(_)
+                | Expr::Path(_)
+                | Expr::Range(_)
+                | Expr::RawAddr(_)
+                | Expr::Reference(_)
+                | Expr::Repeat(_)
+                | Expr::Return(_)
+                | Expr::Struct(_)
+                | Expr::Try(_)
+                | Expr::TryBlock(_)
+                | Expr::Tuple(_)
+                | Expr::Unary(_)
+                | Expr::Unsafe(_)
+                | Expr::While(_)
+                | Expr::Yield(_)
+                | Expr::Verbatim(_) => break,
+            };
         }
-        attrs.extend(attr_target.replace_attrs(Vec::new()));
-        attr_target.replace_attrs(attrs);
 
-        if input.peek(Token![;]) {
-            return Ok(Stmt::Semi(e, input.parse()?));
+        if !attrs.is_empty() {
+            if let Expr::Verbatim(expr_tokens) = attr_target {
+                let mut attr_tokens = verbatim::between(begin, attrs_end);
+                attr_tokens.extend(mem::replace(expr_tokens, TokenStream::new()));
+                *expr_tokens = attr_tokens;
+            } else {
+                let inner_attrs = attr_target.replace_attrs(Vec::new());
+                attrs.extend(inner_attrs);
+                attr_target.replace_attrs(attrs);
+            }
         }
 
-        if allow_nosemi || !expr::requires_terminator(&e) {
-            Ok(Stmt::Expr(e))
+        let semi_token: Option<Token![;]> = input.parse()?;
+
+        match e {
+            Expr::Macro(ExprMacro { attrs, mac })
+                if semi_token.is_some() || mac.delimiter.is_brace() =>
+            {
+                return Ok(Stmt::Macro(StmtMacro {
+                    attrs,
+                    mac,
+                    semi_token,
+                }));
+            }
+            _ => {}
+        }
+
+        if semi_token.is_some() {
+            Ok(Stmt::Expr(e, semi_token))
+        } else if allow_nosemi.0 || !classify::requires_semi_to_be_stmt(&e) {
+            Ok(Stmt::Expr(e, None))
         } else {
             Err(input.error("expected semicolon"))
         }
@@ -272,12 +464,16 @@ pub mod parsing {
 }
 
 #[cfg(feature = "printing")]
-mod printing {
-    use super::*;
-
+pub(crate) mod printing {
+    use crate::classify;
+    use crate::expr::{self, Expr};
+    use crate::fixup::FixupContext;
+    use crate::stmt::{Block, Local, Stmt, StmtMacro};
+    use crate::token;
     use proc_macro2::TokenStream;
-    use quote::{ToTokens, TokenStreamExt};
+    use quote::{ToTokens, TokenStreamExt as _};
 
+    #[cfg_attr(docsrs, doc(cfg(feature = "printing")))]
     impl ToTokens for Block {
         fn to_tokens(&self, tokens: &mut TokenStream) {
             self.brace_token.surround(tokens, |tokens| {
@@ -286,29 +482,54 @@ mod printing {
         }
     }
 
+    #[cfg_attr(docsrs, doc(cfg(feature = "printing")))]
     impl ToTokens for Stmt {
         fn to_tokens(&self, tokens: &mut TokenStream) {
             match self {
                 Stmt::Local(local) => local.to_tokens(tokens),
                 Stmt::Item(item) => item.to_tokens(tokens),
-                Stmt::Expr(expr) => expr.to_tokens(tokens),
-                Stmt::Semi(expr, semi) => {
-                    expr.to_tokens(tokens);
+                Stmt::Expr(expr, semi) => {
+                    expr::printing::print_expr(expr, tokens, FixupContext::new_stmt());
                     semi.to_tokens(tokens);
                 }
+                Stmt::Macro(mac) => mac.to_tokens(tokens),
             }
         }
     }
 
+    #[cfg_attr(docsrs, doc(cfg(feature = "printing")))]
     impl ToTokens for Local {
         fn to_tokens(&self, tokens: &mut TokenStream) {
             expr::printing::outer_attrs_to_tokens(&self.attrs, tokens);
             self.let_token.to_tokens(tokens);
             self.pat.to_tokens(tokens);
-            if let Some((eq_token, init)) = &self.init {
-                eq_token.to_tokens(tokens);
-                init.to_tokens(tokens);
+            if let Some(init) = &self.init {
+                init.eq_token.to_tokens(tokens);
+                expr::printing::print_subexpression(
+                    &init.expr,
+                    init.diverge.is_some() && classify::expr_trailing_brace(&init.expr),
+                    tokens,
+                    FixupContext::NONE,
+                );
+                if let Some((else_token, diverge)) = &init.diverge {
+                    else_token.to_tokens(tokens);
+                    match &**diverge {
+                        Expr::Block(diverge) => diverge.to_tokens(tokens),
+                        _ => token::Brace::default().surround(tokens, |tokens| {
+                            expr::printing::print_expr(diverge, tokens, FixupContext::new_stmt());
+                        }),
+                    }
+                }
             }
+            self.semi_token.to_tokens(tokens);
+        }
+    }
+
+    #[cfg_attr(docsrs, doc(cfg(feature = "printing")))]
+    impl ToTokens for StmtMacro {
+        fn to_tokens(&self, tokens: &mut TokenStream) {
+            expr::printing::outer_attrs_to_tokens(&self.attrs, tokens);
+            self.mac.to_tokens(tokens);
             self.semi_token.to_tokens(tokens);
         }
     }

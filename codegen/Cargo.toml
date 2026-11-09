@@ -2,34 +2,28 @@
 name = "syn-internal-codegen"
 version = "0.0.0"
 authors = ["David Tolnay <dtolnay@gmail.com>", "Nika Layzell <nika@thelayzells.com>"]
-edition = "2018"
+edition = "2024"
 
 publish = false # this is an internal crate which should never be published
 
+[features]
+default = ["json"]
+json = ["syn-codegen/serde"]
+
 [dependencies]
-anyhow = "1.0"
-color-backtrace = "0.2"
-indexmap = { version = "1.0", features = ["serde-1"] }
+anyhow = "1"
+color-backtrace = "0.7"
+indexmap = { version = "2", features = ["serde"] }
+indoc = "2"
 inflections = "1.1"
-proc-macro2 = { version = "1.0", features = ["span-locations"] }
-quote = "1.0"
-semver = { version = "0.9", features = ["serde"] }
-serde = { version = "1.0.88", features = ["derive"] }
+prettyplease = "0.3"
+proc-macro2 = { version = "1.0.20", features = ["span-locations"] }
+quote = "1"
+semver = { version = "1", features = ["serde"] }
+serde = "1.0.88"
 serde_json = "1.0.38"
-syn-codegen = { path = "../json" }
-syn = { path = "..", features = ["full", "extra-traits"] }
-thiserror = "1.0"
-toml = "0.4.10"
-
-# work around https://github.com/crossbeam-rs/crossbeam/issues/435
-# until https://github.com/BurntSushi/ripgrep/pull/1427 is released
-crossbeam-utils = "=0.6.5"
-
-[dependencies.rustfmt]
-package = "rustfmt_lib"
-git = "https://github.com/rust-lang-nursery/rustfmt"
-rev = "99edc8826ee6d7a5d529e8749cdf4ac999dfd954"
+syn = { version = "3", features = ["derive", "full", "parsing", "printing"], default-features = false }
+syn-codegen = { path = "../json", default-features = false }
+toml = { version = "1", default-features = false, features = ["parse", "serde"] }
 
 [workspace]
-# Prefer that `cargo clean` in syn's directory does not require a rebuild of
-# rustfmt in the codegen directory.

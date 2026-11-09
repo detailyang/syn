@@ -1,20 +1,24 @@
-use std::fmt::{self, Debug, Display};
-use std::iter::FromIterator;
-use std::slice;
-use std::vec;
-
+#[cfg(feature = "parsing")]
+use crate::buffer::Cursor;
+use crate::ext::{PunctExt as _, TokenStreamExt as _};
+use crate::thread::ThreadBound;
+#[cfg(feature = "parsing")]
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec;
+use alloc::vec::Vec;
+use core::fmt::{self, Debug, Display};
+#[cfg(feature = "parsing")]
+use core::ops::Range;
+use core::slice;
 use proc_macro2::{
     Delimiter, Group, Ident, LexError, Literal, Punct, Spacing, Span, TokenStream, TokenTree,
 };
 #[cfg(feature = "printing")]
 use quote::ToTokens;
 
-#[cfg(feature = "parsing")]
-use crate::buffer::Cursor;
-use crate::thread::ThreadBound;
-
 /// The result of a Syn parser.
-pub type Result<T> = std::result::Result<T, Error>;
+pub type Result<T> = core::result::Result<T, Error>;
 
 /// Error returned when a Syn parser cannot parse the input tokens.
 ///
@@ -25,34 +29,53 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// [`compile_error!`] in the generated code. This produces a better diagnostic
 /// message than simply panicking the macro.
 ///
-/// [`compile_error!`]: https://doc.rust-lang.org/std/macro.compile_error.html
+/// [`compile_error!`]: core::compile_error!
 ///
 /// When parsing macro input, the [`parse_macro_input!`] macro handles the
 /// conversion to `compile_error!` automatically.
+///
+/// [`parse_macro_input!`]: crate::parse_macro_input!
 ///
 /// ```
 /// # extern crate proc_macro;
 /// #
 /// use proc_macro::TokenStream;
-/// use syn::{parse_macro_input, AttributeArgs, ItemFn};
+/// use syn::parse::{Parse, ParseStream, Result};
+/// use syn::{parse_macro_input, ItemFn};
 ///
 /// # const IGNORE: &str = stringify! {
 /// #[proc_macro_attribute]
 /// # };
 /// pub fn my_attr(args: TokenStream, input: TokenStream) -> TokenStream {
-///     let args = parse_macro_input!(args as AttributeArgs);
+///     let args = parse_macro_input!(args as MyAttrArgs);
 ///     let input = parse_macro_input!(input as ItemFn);
 ///
 ///     /* ... */
 ///     # TokenStream::new()
 /// }
+///
+/// struct MyAttrArgs {
+///     # _k: [(); { stringify! {
+///     ...
+///     # }; 0 }]
+/// }
+///
+/// impl Parse for MyAttrArgs {
+///     fn parse(input: ParseStream) -> Result<Self> {
+///         # stringify! {
+///         ...
+///         # };
+///         # unimplemented!()
+///     }
+/// }
 /// ```
 ///
 /// For errors that arise later than the initial parsing stage, the
-/// [`.to_compile_error()`] method can be used to perform an explicit conversion
-/// to `compile_error!`.
+/// [`.to_compile_error()`] or [`.into_compile_error()`] methods can be used to
+/// perform an explicit conversion to `compile_error!`.
 ///
 /// [`.to_compile_error()`]: Error::to_compile_error
+/// [`.into_compile_error()`]: Error::into_compile_error
 ///
 /// ```
 /// # extern crate proc_macro;
@@ -68,7 +91,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 ///
 ///     // fn(DeriveInput) -> syn::Result<proc_macro2::TokenStream>
 ///     expand::my_derive(input)
-///         .unwrap_or_else(|err| err.to_compile_error())
+///         .unwrap_or_else(syn::Error::into_compile_error)
 ///         .into()
 /// }
 /// #
@@ -81,7 +104,6 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// #     }
 /// # }
 /// ```
-#[derive(Clone)]
 pub struct Error {
     messages: Vec<ErrorMessage>,
 }
@@ -89,12 +111,19 @@ pub struct Error {
 struct ErrorMessage {
     // Span is implemented as an index into a thread-local interner to keep the
     // size small. It is not safe to access from a different thread. We want
-    // errors to be Send and Sync to play nicely with the Failure crate, so pin
-    // the span we're given to its original thread and assume it is
-    // Span::call_site if accessed from any other thread.
-    start_span: ThreadBound<Span>,
-    end_span: ThreadBound<Span>,
+    // errors to be Send and Sync to play nicely with ecosystem crates for error
+    // handling, so pin the span we're given to its original thread and assume
+    // it is Span::call_site if accessed from any other thread.
+    span: ThreadBound<SpanRange>,
     message: String,
+}
+
+// Cannot use core::ops::Range<Span> because that does not implement Copy,
+// whereas ThreadBound<T> requires a Copy impl as a way to ensure no Drop impls
+// are involved.
+struct SpanRange {
+    start: Span,
+    end: Span,
 }
 
 #[cfg(test)]
@@ -133,13 +162,19 @@ impl Error {
     ///     Ok(s)
     /// }
     /// ```
-    pub fn new<T: Display>(span: Span, message: T) -> Self {
-        Error {
-            messages: vec![ErrorMessage {
-                start_span: ThreadBound::new(span),
-                end_span: ThreadBound::new(span),
-                message: message.to_string(),
-            }],
+    pub fn new(span: Span, message: impl Display) -> Self {
+        return new(span, message.to_string());
+
+        fn new(span: Span, message: String) -> Error {
+            Error {
+                messages: vec![ErrorMessage {
+                    span: ThreadBound::new(SpanRange {
+                        start: span,
+                        end: span,
+                    }),
+                    message,
+                }],
+            }
         }
     }
 
@@ -157,16 +192,97 @@ impl Error {
     /// When in doubt it's recommended to stick to `Error::new` (or
     /// `ParseStream::error`)!
     #[cfg(feature = "printing")]
-    pub fn new_spanned<T: ToTokens, U: Display>(tokens: T, message: U) -> Self {
-        let mut iter = tokens.into_token_stream().into_iter();
-        let start = iter.next().map_or_else(Span::call_site, |t| t.span());
-        let end = iter.last().map_or(start, |t| t.span());
-        Error {
-            messages: vec![ErrorMessage {
-                start_span: ThreadBound::new(start),
-                end_span: ThreadBound::new(end),
-                message: message.to_string(),
-            }],
+    #[cfg_attr(docsrs, doc(cfg(feature = "printing")))]
+    pub fn new_spanned(tokens: impl ToTokens, message: impl Display) -> Self {
+        return new_spanned(tokens.into_token_stream(), message.to_string());
+
+        fn new_spanned(tokens: TokenStream, message: String) -> Error {
+            let mut iter = tokens.into_iter();
+            let start = iter.next().map_or_else(Span::call_site, |t| t.span());
+            let end = iter.last().map_or(start, |t| t.span());
+            Error {
+                messages: vec![ErrorMessage {
+                    span: ThreadBound::new(SpanRange { start, end }),
+                    message,
+                }],
+            }
+        }
+    }
+
+    /// Creates an error spanning the given cursor range.
+    ///
+    /// # Example
+    ///
+    /// This parses a sequence of '+'-separated lifetimes and types like
+    /// `Vec<u8> + dyn Display + 'static`, at least one of which must be a type.
+    ///
+    /// ```
+    /// use syn::{Lifetime, Token, Type};
+    /// use syn::parse::{Error, ParseStream, Result};
+    ///
+    /// enum Thing {
+    ///     Lifetime(Lifetime),
+    ///     Type(Type),
+    /// }
+    ///
+    /// fn parse_things(input: ParseStream) -> Result<Vec<Thing>> {
+    ///     let things_begin = input.cursor();
+    ///     let things_end;
+    ///     let mut things = Vec::new();
+    ///     let mut has_type = false;
+    ///     loop {
+    ///         if input.peek(Lifetime) {
+    ///             let lifetime: Lifetime = input.parse()?;
+    ///             things.push(Thing::Lifetime(lifetime));
+    ///         } else {
+    ///             let ty = input.call(Type::without_plus)?;
+    ///             things.push(Thing::Type(ty));
+    ///             has_type = true;
+    ///         }
+    ///         let plus_token: Option<Token![+]> = input.parse()?;
+    ///         if plus_token.is_none() {
+    ///             things_end = input.cursor();
+    ///             break;
+    ///         }
+    ///     }
+    ///
+    ///     if has_type {
+    ///         Ok(things)
+    ///     } else {
+    ///         let msg = "things must not be all lifetimes, at least one type is required";
+    ///         Err(Error::new_range(things_begin..things_end, msg))
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// ```text
+    /// error: things must not be all lifetimes, at least one type is required
+    ///  --> example.rs:4:23
+    ///   |
+    /// 4 |     example!(THINGS = 'a + 'b, ...);
+    ///   |                       ^^^^^^^
+    /// ```
+    #[cfg(feature = "parsing")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "parsing")))]
+    pub fn new_range<'a>(span: impl Into<Range<Cursor<'a>>>, message: impl Display) -> Self {
+        return new_range(span.into(), message.to_string());
+
+        fn new_range(span: Range<Cursor>, message: String) -> Error {
+            assert!(crate::buffer::same_buffer(span.start, span.end));
+            assert!(span.start <= span.end);
+            Error {
+                messages: vec![ErrorMessage {
+                    span: ThreadBound::new(SpanRange {
+                        start: span.start.span(),
+                        end: if span.start == span.end {
+                            span.end.span()
+                        } else {
+                            span.end.prev_span()
+                        },
+                    }),
+                    message,
+                }],
+            }
         }
     }
 
@@ -176,11 +292,7 @@ impl Error {
     /// if called from a different thread than the one on which the `Error` was
     /// originally created.
     pub fn span(&self) -> Span {
-        let start = match self.messages[0].start_span.get() {
-            Some(span) => *span,
-            None => return Span::call_site(),
-        };
-        let end = match self.messages[0].end_span.get() {
+        let SpanRange { start, end } = match self.messages[0].span.get() {
             Some(span) => *span,
             None => return Span::call_site(),
         };
@@ -192,55 +304,111 @@ impl Error {
     /// The [`parse_macro_input!`] macro provides a convenient way to invoke
     /// this method correctly in a procedural macro.
     ///
-    /// [`compile_error!`]: https://doc.rust-lang.org/std/macro.compile_error.html
+    /// [`compile_error!`]: core::compile_error!
+    /// [`parse_macro_input!`]: crate::parse_macro_input!
     pub fn to_compile_error(&self) -> TokenStream {
-        self.messages
-            .iter()
-            .map(ErrorMessage::to_compile_error)
-            .collect()
+        let mut tokens = TokenStream::new();
+        for msg in &self.messages {
+            ErrorMessage::to_compile_error(msg, &mut tokens);
+        }
+        tokens
+    }
+
+    /// Render the error as an invocation of [`compile_error!`].
+    ///
+    /// [`compile_error!`]: core::compile_error!
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # extern crate proc_macro;
+    /// #
+    /// use proc_macro::TokenStream;
+    /// use syn::{parse_macro_input, DeriveInput, Error};
+    ///
+    /// # const _: &str = stringify! {
+    /// #[proc_macro_derive(MyTrait)]
+    /// # };
+    /// pub fn derive_my_trait(input: TokenStream) -> TokenStream {
+    ///     let input = parse_macro_input!(input as DeriveInput);
+    ///     my_trait::expand(input)
+    ///         .unwrap_or_else(Error::into_compile_error)
+    ///         .into()
+    /// }
+    ///
+    /// mod my_trait {
+    ///     use proc_macro2::TokenStream;
+    ///     use syn::{DeriveInput, Result};
+    ///
+    ///     pub(crate) fn expand(input: DeriveInput) -> Result<TokenStream> {
+    ///         /* ... */
+    ///         # unimplemented!()
+    ///     }
+    /// }
+    /// ```
+    pub fn into_compile_error(self) -> TokenStream {
+        self.to_compile_error()
     }
 
     /// Add another error message to self such that when `to_compile_error()` is
     /// called, both errors will be emitted together.
     pub fn combine(&mut self, another: Error) {
-        self.messages.extend(another.messages)
+        self.messages.extend(another.messages);
     }
 }
 
 impl ErrorMessage {
-    fn to_compile_error(&self) -> TokenStream {
-        let start = self
-            .start_span
-            .get()
-            .cloned()
-            .unwrap_or_else(Span::call_site);
-        let end = self.end_span.get().cloned().unwrap_or_else(Span::call_site);
+    fn to_compile_error(&self, tokens: &mut TokenStream) {
+        let (start, end) = match self.span.get() {
+            Some(range) => (range.start, range.end),
+            None => (Span::call_site(), Span::call_site()),
+        };
 
-        // compile_error!($message)
-        TokenStream::from_iter(vec![
-            TokenTree::Ident(Ident::new("compile_error", start)),
-            TokenTree::Punct({
-                let mut punct = Punct::new('!', Spacing::Alone);
-                punct.set_span(start);
-                punct
-            }),
-            TokenTree::Group({
-                let mut group = Group::new(Delimiter::Brace, {
-                    TokenStream::from_iter(vec![TokenTree::Literal({
-                        let mut string = Literal::string(&self.message);
-                        string.set_span(end);
-                        string
-                    })])
-                });
-                group.set_span(end);
-                group
-            }),
-        ])
+        // ::core::compile_error!($message)
+        tokens.append(TokenTree::Punct(Punct::new_spanned(
+            ':',
+            Spacing::Joint,
+            start,
+        )));
+        tokens.append(TokenTree::Punct(Punct::new_spanned(
+            ':',
+            Spacing::Alone,
+            start,
+        )));
+        tokens.append(TokenTree::Ident(Ident::new("core", start)));
+        tokens.append(TokenTree::Punct(Punct::new_spanned(
+            ':',
+            Spacing::Joint,
+            start,
+        )));
+        tokens.append(TokenTree::Punct(Punct::new_spanned(
+            ':',
+            Spacing::Alone,
+            start,
+        )));
+        tokens.append(TokenTree::Ident(Ident::new("compile_error", start)));
+        tokens.append(TokenTree::Punct(Punct::new_spanned(
+            '!',
+            Spacing::Alone,
+            start,
+        )));
+        tokens.append(TokenTree::Group({
+            let mut group = Group::new(
+                Delimiter::Brace,
+                TokenStream::from({
+                    let mut string = Literal::string(&self.message);
+                    string.set_span(end);
+                    TokenTree::Literal(string)
+                }),
+            );
+            group.set_span(end);
+            group
+        }));
     }
 }
 
 #[cfg(feature = "parsing")]
-pub fn new_at<T: Display>(scope: Span, cursor: Cursor, message: T) -> Error {
+pub(crate) fn new_at<T: Display>(scope: Span, cursor: Cursor, message: T) -> Error {
     if cursor.eof() {
         Error::new(scope, format!("unexpected end of input, {}", message))
     } else {
@@ -250,13 +418,16 @@ pub fn new_at<T: Display>(scope: Span, cursor: Cursor, message: T) -> Error {
 }
 
 #[cfg(all(feature = "parsing", any(feature = "full", feature = "derive")))]
-pub fn new2<T: Display>(start: Span, end: Span, message: T) -> Error {
-    Error {
-        messages: vec![ErrorMessage {
-            start_span: ThreadBound::new(start),
-            end_span: ThreadBound::new(end),
-            message: message.to_string(),
-        }],
+pub(crate) fn new2<T: Display>(start: Span, end: Span, message: T) -> Error {
+    return new2(start, end, message.to_string());
+
+    fn new2(start: Span, end: Span, message: String) -> Error {
+        Error {
+            messages: vec![ErrorMessage {
+                span: ThreadBound::new(SpanRange { start, end }),
+                message,
+            }],
+        }
     }
 }
 
@@ -288,31 +459,37 @@ impl Display for Error {
     }
 }
 
+impl Clone for Error {
+    fn clone(&self) -> Self {
+        Error {
+            messages: self.messages.clone(),
+        }
+    }
+}
+
 impl Clone for ErrorMessage {
     fn clone(&self) -> Self {
-        let start = self
-            .start_span
-            .get()
-            .cloned()
-            .unwrap_or_else(Span::call_site);
-        let end = self.end_span.get().cloned().unwrap_or_else(Span::call_site);
         ErrorMessage {
-            start_span: ThreadBound::new(start),
-            end_span: ThreadBound::new(end),
+            span: self.span,
             message: self.message.clone(),
         }
     }
 }
 
-impl std::error::Error for Error {
-    fn description(&self) -> &str {
-        "parse error"
+impl Clone for SpanRange {
+    fn clone(&self) -> Self {
+        *self
     }
 }
 
+impl Copy for SpanRange {}
+
+// TODO: impl core::error::Error (requires Rust 1.81+)
+impl std::error::Error for Error {}
+
 impl From<LexError> for Error {
     fn from(err: LexError) -> Self {
-        Error::new(Span::call_site(), format!("{:?}", err))
+        Error::new(err.span(), err)
     }
 }
 

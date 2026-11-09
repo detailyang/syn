@@ -1,22 +1,20 @@
-use super::*;
+#[cfg(feature = "parsing")]
+use crate::error::Result;
+#[cfg(feature = "parsing")]
+use crate::parse::{Parse, ParseStream, Parser};
+use crate::path::Path;
 use crate::token::{Brace, Bracket, Paren};
+use proc_macro2::extra::DelimSpan;
+#[cfg(feature = "parsing")]
+use proc_macro2::Delimiter;
 use proc_macro2::TokenStream;
 #[cfg(feature = "parsing")]
-use proc_macro2::{Delimiter, Group, Span, TokenTree};
-
-#[cfg(feature = "parsing")]
-use crate::parse::{Parse, ParseStream, Parser, Result};
-#[cfg(feature = "extra-traits")]
-use crate::tt::TokenStreamHelper;
-#[cfg(feature = "extra-traits")]
-use std::hash::{Hash, Hasher};
+use proc_macro2::TokenTree;
 
 ast_struct! {
     /// A macro invocation: `println!("{}", mac)`.
-    ///
-    /// *This type is available only if Syn is built with the `"derive"` or `"full"`
-    /// feature.*
-    pub struct Macro #manual_extra_traits {
+    #[cfg_attr(docsrs, doc(cfg(any(feature = "full", feature = "derive"))))]
+    pub struct Macro {
         pub path: Path,
         pub bang_token: Token![!],
         pub delimiter: MacroDelimiter,
@@ -26,9 +24,7 @@ ast_struct! {
 
 ast_enum! {
     /// A grouping token that surrounds a macro body: `m!(...)` or `m!{...}` or `m![...]`.
-    ///
-    /// *This type is available only if Syn is built with the `"derive"` or `"full"`
-    /// feature.*
+    #[cfg_attr(docsrs, doc(cfg(any(feature = "full", feature = "derive"))))]
     pub enum MacroDelimiter {
         Paren(Paren),
         Brace(Brace),
@@ -36,46 +32,22 @@ ast_enum! {
     }
 }
 
-#[cfg(feature = "extra-traits")]
-impl Eq for Macro {}
-
-#[cfg(feature = "extra-traits")]
-impl PartialEq for Macro {
-    fn eq(&self, other: &Self) -> bool {
-        self.path == other.path
-            && self.bang_token == other.bang_token
-            && self.delimiter == other.delimiter
-            && TokenStreamHelper(&self.tokens) == TokenStreamHelper(&other.tokens)
+impl MacroDelimiter {
+    pub fn span(&self) -> &DelimSpan {
+        match self {
+            MacroDelimiter::Paren(token) => &token.span,
+            MacroDelimiter::Brace(token) => &token.span,
+            MacroDelimiter::Bracket(token) => &token.span,
+        }
     }
-}
 
-#[cfg(feature = "extra-traits")]
-impl Hash for Macro {
-    fn hash<H>(&self, state: &mut H)
-    where
-        H: Hasher,
-    {
-        self.path.hash(state);
-        self.bang_token.hash(state);
-        self.delimiter.hash(state);
-        TokenStreamHelper(&self.tokens).hash(state);
+    #[cfg(all(feature = "full", any(feature = "parsing", feature = "printing")))]
+    pub(crate) fn is_brace(&self) -> bool {
+        match self {
+            MacroDelimiter::Brace(_) => true,
+            MacroDelimiter::Paren(_) | MacroDelimiter::Bracket(_) => false,
+        }
     }
-}
-
-#[cfg(feature = "parsing")]
-fn delimiter_span_close(macro_delimiter: &MacroDelimiter) -> Span {
-    let delimiter = match macro_delimiter {
-        MacroDelimiter::Paren(_) => Delimiter::Parenthesis,
-        MacroDelimiter::Brace(_) => Delimiter::Brace,
-        MacroDelimiter::Bracket(_) => Delimiter::Bracket,
-    };
-    let mut group = Group::new(delimiter, TokenStream::new());
-    group.set_span(match macro_delimiter {
-        MacroDelimiter::Paren(token) => token.span,
-        MacroDelimiter::Brace(token) => token.span,
-        MacroDelimiter::Bracket(token) => token.span,
-    });
-    group.span_close()
 }
 
 impl Macro {
@@ -162,6 +134,7 @@ impl Macro {
     /// }
     /// ```
     #[cfg(feature = "parsing")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "parsing")))]
     pub fn parse_body<T: Parse>(&self) -> Result<T> {
         self.parse_body_with(T::parse)
     }
@@ -169,17 +142,18 @@ impl Macro {
     /// Parse the tokens within the macro invocation's delimiters using the
     /// given parser.
     #[cfg(feature = "parsing")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "parsing")))]
     pub fn parse_body_with<F: Parser>(&self, parser: F) -> Result<F::Output> {
-        let scope = delimiter_span_close(&self.delimiter);
+        let scope = self.delimiter.span().close();
         crate::parse::parse_scoped(parser, scope, self.tokens.clone())
     }
 }
 
 #[cfg(feature = "parsing")]
-pub fn parse_delimiter(input: ParseStream) -> Result<(MacroDelimiter, TokenStream)> {
+pub(crate) fn parse_delimiter(input: ParseStream) -> Result<(MacroDelimiter, TokenStream)> {
     input.step(|cursor| {
         if let Some((TokenTree::Group(g), rest)) = cursor.token_tree() {
-            let span = g.span();
+            let span = g.delim_span();
             let delimiter = match g.delimiter() {
                 Delimiter::Parenthesis => MacroDelimiter::Paren(Paren(span)),
                 Delimiter::Brace => MacroDelimiter::Brace(Brace(span)),
@@ -196,11 +170,13 @@ pub fn parse_delimiter(input: ParseStream) -> Result<(MacroDelimiter, TokenStrea
 }
 
 #[cfg(feature = "parsing")]
-pub mod parsing {
-    use super::*;
+pub(crate) mod parsing {
+    use crate::error::Result;
+    use crate::mac::{parse_delimiter, Macro};
+    use crate::parse::{Parse, ParseStream};
+    use crate::path::Path;
 
-    use crate::parse::{Parse, ParseStream, Result};
-
+    #[cfg_attr(docsrs, doc(cfg(feature = "parsing")))]
     impl Parse for Macro {
         fn parse(input: ParseStream) -> Result<Self> {
             let tokens;
@@ -220,25 +196,30 @@ pub mod parsing {
 
 #[cfg(feature = "printing")]
 mod printing {
-    use super::*;
-    use proc_macro2::TokenStream;
+    use crate::mac::{Macro, MacroDelimiter};
+    use crate::path;
+    use crate::path::printing::PathStyle;
+    use crate::token;
+    use proc_macro2::{Delimiter, TokenStream};
     use quote::ToTokens;
 
+    impl MacroDelimiter {
+        pub(crate) fn surround(&self, tokens: &mut TokenStream, inner: TokenStream) {
+            let (delim, span) = match self {
+                MacroDelimiter::Paren(paren) => (Delimiter::Parenthesis, paren.span),
+                MacroDelimiter::Brace(brace) => (Delimiter::Brace, brace.span),
+                MacroDelimiter::Bracket(bracket) => (Delimiter::Bracket, bracket.span),
+            };
+            token::printing::delim(delim, span.join(), tokens, inner);
+        }
+    }
+
+    #[cfg_attr(docsrs, doc(cfg(feature = "printing")))]
     impl ToTokens for Macro {
         fn to_tokens(&self, tokens: &mut TokenStream) {
-            self.path.to_tokens(tokens);
+            path::printing::print_path(tokens, &self.path, PathStyle::Mod);
             self.bang_token.to_tokens(tokens);
-            match &self.delimiter {
-                MacroDelimiter::Paren(paren) => {
-                    paren.surround(tokens, |tokens| self.tokens.to_tokens(tokens));
-                }
-                MacroDelimiter::Brace(brace) => {
-                    brace.surround(tokens, |tokens| self.tokens.to_tokens(tokens));
-                }
-                MacroDelimiter::Bracket(bracket) => {
-                    bracket.surround(tokens, |tokens| self.tokens.to_tokens(tokens));
-                }
-            }
+            self.delimiter.surround(tokens, self.tokens.clone());
         }
     }
 }

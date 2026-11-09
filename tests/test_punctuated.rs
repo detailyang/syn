@@ -1,8 +1,25 @@
+#![allow(
+    clippy::elidable_lifetime_names,
+    clippy::needless_lifetimes,
+    clippy::uninlined_format_args
+)]
+
 use syn::punctuated::{Pair, Punctuated};
 use syn::Token;
 
-#[macro_use]
-mod macros;
+macro_rules! punctuated {
+    ($($e:expr,)+) => {{
+        let mut seq = ::syn::punctuated::Punctuated::new();
+        $(
+            seq.push($e);
+        )+
+        seq
+    }};
+
+    ($($e:expr),+) => {
+        punctuated!($($e,)+)
+    };
+}
 
 macro_rules! check_exact_size_iterator {
     ($iter:expr) => {{
@@ -46,4 +63,30 @@ fn iter() {
     assert_eq!(p.iter().next_back(), Some(&4));
     assert_eq!(p.iter_mut().next_back(), Some(&mut 4));
     assert_eq!(p.into_iter().next_back(), Some(4));
+}
+
+#[test]
+fn may_dangle() {
+    let p: Punctuated<_, Token![,]> = punctuated!(2, 3, 4);
+    for element in &p {
+        if *element == 2 {
+            drop(p);
+            break;
+        }
+    }
+
+    let mut p: Punctuated<_, Token![,]> = punctuated!(2, 3, 4);
+    for element in &mut p {
+        if *element == 2 {
+            drop(p);
+            break;
+        }
+    }
+}
+
+#[test]
+#[should_panic = "index out of bounds: the len is 0 but the index is 0"]
+fn index_out_of_bounds() {
+    let p = Punctuated::<syn::Ident, Token![,]>::new();
+    let _ = p[0].clone();
 }

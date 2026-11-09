@@ -1,6 +1,6 @@
 use std::mem;
 
-pub use heapsize_derive::*;
+pub use heapsize_derive::HeapSize;
 
 pub trait HeapSize {
     /// Total number of bytes of heap memory owned by `self`.
@@ -35,8 +35,8 @@ where
     T: ?Sized + HeapSize,
 {
     /// A `Box` owns however much heap memory was allocated to hold the value of
-    /// type `T` that we placed on the heap, plus transitively however much `T`
-    /// itself owns.
+    /// type `T` that we placed on the heap, plus transitively however much the
+    /// `T` owns.
     fn heap_size_of_children(&self) -> usize {
         mem::size_of_val(&**self) + (**self).heap_size_of_children()
     }
@@ -53,7 +53,7 @@ where
     }
 }
 
-impl<'a, T> HeapSize for &'a T
+impl<T> HeapSize for &T
 where
     T: ?Sized,
 {

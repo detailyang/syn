@@ -1,9 +1,9 @@
+use crate::cfg::{self, DocCfg};
 use inflections::Inflect;
 use proc_macro2::{Ident, Span, TokenStream};
-use quote::quote;
 use syn_codegen::{Data, Definitions, Features, Node};
 
-pub const TERMINAL_TYPES: &[&str] = &["Span", "Ident"];
+pub const TERMINAL_TYPES: [&str; 2] = ["Ident", "TokenStream"];
 
 pub fn under_name(name: &str) -> Ident {
     Ident::new(&name.to_snake_case(), Span::call_site())
@@ -16,7 +16,7 @@ pub fn traverse(
     let mut types = defs.types.clone();
     for terminal in TERMINAL_TYPES {
         types.push(Node {
-            ident: terminal.to_string(),
+            ident: terminal.to_owned(),
             features: Features::default(),
             data: Data::Private,
             exhaustive: true,
@@ -27,15 +27,10 @@ pub fn traverse(
     let mut traits = TokenStream::new();
     let mut impls = TokenStream::new();
     for s in types {
-        if s.ident == "Reserved" {
+        if s.ident.ends_with("Modifiers") {
             continue;
         }
-        let features = &s.features.any;
-        let features = match features.len() {
-            0 => quote!(),
-            1 => quote!(#[cfg(feature = #(#features)*)]),
-            _ => quote!(#[cfg(any(#(feature = #features),*))]),
-        };
+        let features = cfg::features(&s.features, DocCfg::Ordinary);
         traits.extend(features.clone());
         impls.extend(features);
         node(&mut traits, &mut impls, &s, defs);

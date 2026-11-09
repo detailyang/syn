@@ -1,16 +1,19 @@
-use proc_macro2::{Delimiter, Group, Punct, Spacing, TokenStream, TokenTree};
-use std::iter::FromIterator;
-use syn::parse::{discouraged::Speculative, Parse, ParseStream, Parser, Result};
+#![allow(clippy::non_ascii_literal)]
+
+use proc_macro2::{Delimiter, Group, Ident, Punct, Spacing, TokenStream, TokenTree};
+use std::panic;
+use syn::parse::discouraged::Speculative as _;
+use syn::parse::{Parse, ParseStream, Parser, Result};
 use syn::{parenthesized, Token};
 
 #[test]
-#[should_panic(expected = "Fork was not derived from the advancing parse stream")]
+#[should_panic(expected = "fork was not derived from the advancing parse stream")]
 fn smuggled_speculative_cursor_between_sources() {
     struct BreakRules;
     impl Parse for BreakRules {
         fn parse(input1: ParseStream) -> Result<Self> {
             let nested = |input2: ParseStream| {
-                input1.advance_to(&input2);
+                input1.advance_to(input2);
                 Ok(Self)
             };
             nested.parse_str("")
@@ -21,7 +24,7 @@ fn smuggled_speculative_cursor_between_sources() {
 }
 
 #[test]
-#[should_panic(expected = "Fork was not derived from the advancing parse stream")]
+#[should_panic(expected = "fork was not derived from the advancing parse stream")]
 fn smuggled_speculative_cursor_between_brackets() {
     struct BreakRules;
     impl Parse for BreakRules {
@@ -39,7 +42,7 @@ fn smuggled_speculative_cursor_between_brackets() {
 }
 
 #[test]
-#[should_panic(expected = "Fork was not derived from the advancing parse stream")]
+#[should_panic(expected = "fork was not derived from the advancing parse stream")]
 fn smuggled_speculative_cursor_into_brackets() {
     struct BreakRules;
     impl Parse for BreakRules {
@@ -66,12 +69,12 @@ fn trailing_empty_none_group() {
         Ok(())
     }
 
-    // `+ ( + <Ø Ø> ) <Ø <Ø Ø> Ø>`
-    let tokens = TokenStream::from_iter(vec![
+    // `+ ( + «∅ ∅» ) «∅ «∅ ∅» ∅»`
+    let tokens = TokenStream::from_iter([
         TokenTree::Punct(Punct::new('+', Spacing::Alone)),
         TokenTree::Group(Group::new(
             Delimiter::Parenthesis,
-            TokenStream::from_iter(vec![
+            TokenStream::from_iter([
                 TokenTree::Punct(Punct::new('+', Spacing::Alone)),
                 TokenTree::Group(Group::new(Delimiter::None, TokenStream::new())),
             ]),
@@ -79,7 +82,7 @@ fn trailing_empty_none_group() {
         TokenTree::Group(Group::new(Delimiter::None, TokenStream::new())),
         TokenTree::Group(Group::new(
             Delimiter::None,
-            TokenStream::from_iter(vec![TokenTree::Group(Group::new(
+            TokenStream::from_iter([TokenTree::Group(Group::new(
                 Delimiter::None,
                 TokenStream::new(),
             ))]),
@@ -87,4 +90,15 @@ fn trailing_empty_none_group() {
     ]);
 
     parse.parse2(tokens).unwrap();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)] // https://github.com/rust-lang/miri/issues/4793
+fn test_unwind_safe() {
+    fn parse(input: ParseStream) -> Result<Ident> {
+        let thread_result = panic::catch_unwind(|| input.parse());
+        thread_result.unwrap()
+    }
+
+    parse.parse_str("throw").unwrap();
 }

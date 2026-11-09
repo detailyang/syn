@@ -10,13 +10,15 @@
 //!
 //!     File {
 //!         shebang: None,
+//!         frontmatter: None,
 //!         attrs: [
 //!             Attribute {
-//!                 pound_token: Pound,
-//!                 style: Inner(
+//!                 pound_token: Token![#],
+//!                 style: AttrStyle::Inner(
 //!         ...
 //!     }
 
+use colored::Colorize;
 use std::borrow::Cow;
 use std::env;
 use std::ffi::OsStr;
@@ -25,8 +27,6 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process;
-
-use colored::Colorize;
 
 enum Error {
     IncorrectUsage,
@@ -40,12 +40,10 @@ enum Error {
 
 impl Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use self::Error::*;
-
         match self {
-            IncorrectUsage => write!(f, "Usage: dump-syntax path/to/filename.rs"),
-            ReadFile(error) => write!(f, "Unable to read file: {}", error),
-            ParseFile {
+            Error::IncorrectUsage => write!(f, "Usage: dump-syntax path/to/filename.rs"),
+            Error::ReadFile(error) => write!(f, "Unable to read file: {}", error),
+            Error::ParseFile {
                 error,
                 filepath,
                 source_code,
@@ -100,13 +98,8 @@ fn render_location(
     let start = err.span().start();
     let mut end = err.span().end();
 
-    if start.line == end.line && start.column == end.column {
+    let Some(code_line) = start.line.checked_sub(1).and_then(|n| code.lines().nth(n)) else {
         return render_fallback(formatter, err);
-    }
-
-    let code_line = match code.lines().nth(start.line - 1) {
-        Some(line) => line,
-        None => return render_fallback(formatter, err),
     };
 
     if end.line > start.line {
@@ -116,8 +109,7 @@ fn render_location(
 
     let filename = filepath
         .file_name()
-        .map(OsStr::to_string_lossy)
-        .unwrap_or(Cow::Borrowed("main.rs"));
+        .map_or(Cow::Borrowed("main.rs"), OsStr::to_string_lossy);
 
     write!(
         formatter,
@@ -139,7 +131,10 @@ fn render_location(
         label = start.line.to_string().blue().bold(),
         code = code_line.trim_end(),
         offset = " ".repeat(start.column),
-        underline = "^".repeat(end.column - start.column).red().bold(),
+        underline = "^"
+            .repeat(end.column.saturating_sub(start.column).max(1))
+            .red()
+            .bold(),
         message = err.to_string().red(),
     )
 }
